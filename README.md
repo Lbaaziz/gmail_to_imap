@@ -45,6 +45,8 @@ A Python-based system that transfers emails from Gmail to any IMAP server while 
 3. Enable the Gmail API:
    - Go to "APIs & Services" > "Library"
    - Search for "Gmail API" and enable it
+4. Add the gmail accounts you'll migrate as your test users
+
 
 ### 2. Create OAuth 2.0 Credentials
 1. Go to "APIs & Services" > "Credentials"
