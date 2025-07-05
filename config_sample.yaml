@@ -1,0 +1,24 @@
+# Gmail to IMAP Transfer Configuration
+
+gmail:
+  credentials_file: "credentials.json"
+  
+imap:
+  server: "your-imap-server.com"  # e.g., "imap.example.com"
+  port: 993                       # Usually 993 for SSL, 143 for non-SSL
+  username: "your-email@domain.com"
+  password: "your-imap-password"
+  use_ssl: true
+
+settings:
+  batch_size: 50                  # Adjust based on server limits
+  max_retries: 3
+  resume_from_progress: true
+  
+  # Customize label mappings as needed
+  label_mappings:
+    "INBOX": "INBOX"
+    "SENT": "Sent"
+    "DRAFT": "Drafts"
+    "SPAM": "Junk"
+    "TRASH": "Trash"

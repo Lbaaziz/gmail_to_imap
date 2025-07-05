@@ -64,10 +64,10 @@ A Python-based system that transfers emails from Gmail to any IMAP server while 
 
 1. **Copy and edit the configuration file**
    ```bash
-   cp config.yaml my_config.yaml
+   cp config_sample.yaml config.yaml
    ```
 
-2. **Edit `my_config.yaml` with your settings**
+2. **Edit `config.yaml` with your settings**
    ```yaml
    gmail:
      credentials_file: "credentials.json"
