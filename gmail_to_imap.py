@@ -382,7 +382,7 @@ class GmailClient:
 
 
 class IMAPClient:
-    """Handles IMAP server operations."""
+    """Handles IMAP server operations with SSL stability."""
     
     def __init__(self, server: str, port: int, username: str, password: str, use_ssl: bool = True):
         self.server = server
@@ -394,6 +394,9 @@ class IMAPClient:
         self.connection_start_time = None
         self.connection_errors = 0
         self.last_activity = None
+        self.total_uploads = 0
+        self.max_connection_duration = 900  # 15 minutes max connection time
+        self.max_uploads_per_connection = 100  # Max uploads before reconnect
         self.connect()
     
     def connect(self) -> None:
@@ -483,37 +486,111 @@ class IMAPClient:
             return f"INBOX.{folder_name}"
     
     def upload_message(self, folder_name: str, message_data: bytes, flags: List[str] = None, msg_time: datetime = None) -> None:
-        """Upload message to IMAP folder with connection health tracking."""
-        try:
-            if flags is None:
-                flags = []
-            
-            # Check connection health before upload
-            self._check_connection_health()
-            
-            # Apply namespace prefix if needed
-            full_folder_name = self._get_full_folder_name(folder_name)
-            
-            # Track activity
-            start_time = time.time()
-            self.client.append(full_folder_name, message_data, flags, msg_time)
-            self.last_activity = time.time()
-            
-            # Log slow uploads
-            upload_time = self.last_activity - start_time
-            if upload_time > 5.0:  # More than 5 seconds
-                logging.warning(f"⚠️ Slow IMAP upload: {upload_time:.2f}s for message to {folder_name}")
+        """Upload message to IMAP folder with SSL stability and connection recycling."""
+        max_retries = 3
+        
+        for attempt in range(max_retries):
+            try:
+                if flags is None:
+                    flags = []
                 
-        except Exception as e:
-            self.connection_errors += 1
-            full_folder_name = self._get_full_folder_name(folder_name)
+                # Check if connection needs recycling BEFORE upload
+                if self._should_recycle_connection():
+                    logging.info("🔄 Recycling IMAP connection for SSL stability")
+                    self._reconnect()
+                
+                # Check connection health before upload
+                self._check_connection_health()
+                
+                # Apply namespace prefix if needed
+                full_folder_name = self._get_full_folder_name(folder_name)
+                
+                # Track activity
+                start_time = time.time()
+                self.client.append(full_folder_name, message_data, flags, msg_time)
+                self.last_activity = time.time()
+                self.total_uploads += 1
+                
+                # Log slow uploads
+                upload_time = self.last_activity - start_time
+                if upload_time > 5.0:  # More than 5 seconds
+                    logging.warning(f"⚠️ Slow IMAP upload: {upload_time:.2f}s for message to {folder_name}")
+                
+                return  # Success - exit retry loop
+                
+            except Exception as e:
+                self.connection_errors += 1
+                full_folder_name = self._get_full_folder_name(folder_name)
+                
+                # Check if this is an SSL/connection error that should trigger reconnection
+                is_ssl_error = ("SSL" in str(e) or "socket" in str(e).lower() or
+                               "LOGOUT" in str(e) or "connection" in str(e).lower())
+                
+                if is_ssl_error:
+                    logging.error(f"🔌 IMAP connection error #{self.connection_errors}: {e}")
+                    self._log_connection_diagnostics()
+                    
+                    # Try to reconnect for SSL errors (except on last attempt)
+                    if attempt < max_retries - 1:
+                        logging.info(f"🔄 Attempting reconnection (attempt {attempt + 1}/{max_retries})")
+                        try:
+                            self._reconnect()
+                            time.sleep(1)  # Brief pause before retry
+                            continue
+                        except Exception as reconnect_error:
+                            logging.error(f"❌ Reconnection failed: {reconnect_error}")
+                else:
+                    logging.error(f"Failed to upload message to {folder_name} (full name: {full_folder_name}): {e}")
+                
+                # If this is the last attempt or not an SSL error, re-raise
+                if attempt == max_retries - 1:
+                    raise
+    
+    def _should_recycle_connection(self) -> bool:
+        """Check if connection should be recycled for SSL stability."""
+        if not self.connection_start_time:
+            return False
             
-            # Log connection-specific errors
-            if "SSL" in str(e) or "socket" in str(e).lower():
-                logging.error(f"🔌 IMAP connection error #{self.connection_errors}: {e}")
-                self._log_connection_diagnostics()
-            else:
-                logging.error(f"Failed to upload message to {folder_name} (full name: {full_folder_name}): {e}")
+        # Check connection duration
+        connection_age = time.time() - self.connection_start_time
+        if connection_age > self.max_connection_duration:
+            logging.info(f"🕒 Connection recycling: age {connection_age:.1f}s > {self.max_connection_duration}s")
+            return True
+        
+        # Check upload count
+        if self.total_uploads >= self.max_uploads_per_connection:
+            logging.info(f"📊 Connection recycling: {self.total_uploads} uploads >= {self.max_uploads_per_connection}")
+            return True
+        
+        # Check error rate
+        if self.connection_errors >= 10:  # Too many errors
+            logging.info(f"❌ Connection recycling: {self.connection_errors} errors")
+            return True
+            
+        return False
+    
+    def _reconnect(self) -> None:
+        """Safely reconnect to IMAP server."""
+        try:
+            # Close existing connection
+            if self.client:
+                try:
+                    self.client.logout()
+                except:
+                    pass  # Ignore errors on logout
+                self.client = None
+            
+            # Reset counters
+            old_errors = self.connection_errors
+            self.connection_errors = 0
+            self.total_uploads = 0
+            
+            # Reconnect
+            self.connect()
+            logging.info(f"✅ IMAP reconnection successful (previous errors: {old_errors})")
+            
+        except Exception as e:
+            logging.error(f"❌ IMAP reconnection failed: {e}")
             raise
     
     def _check_connection_health(self) -> None:
@@ -588,6 +665,26 @@ class GmailToImapTransfer:
         self.message_cache = {}
         self.cache_hits = 0
         self.cache_misses = 0
+        
+        # Thread management and shutdown handling
+        self.active_threads = []
+        self.shutdown_requested = False
+        self._setup_signal_handlers()
+    
+    def _setup_signal_handlers(self) -> None:
+        """Setup signal handlers for graceful shutdown."""
+        def signal_handler(signum, frame):
+            logging.info(f"🛑 Received signal {signum}, initiating graceful shutdown...")
+            self.shutdown_requested = True
+            
+            # Notify all active threads to stop
+            for thread_info in self.active_threads:
+                if 'stop_event' in thread_info:
+                    thread_info['stop_event'].set()
+        
+        # Register handlers for common termination signals
+        signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+        signal.signal(signal.SIGTERM, signal_handler)  # Termination request
     
     def setup_clients(self) -> None:
         """Initialize Gmail and IMAP clients."""
@@ -775,6 +872,17 @@ class GmailToImapTransfer:
         # Thread communication
         message_queue = queue.Queue(maxsize=100)  # Limit queue size to prevent memory issues
         stop_event = threading.Event()
+        transfer_id = f"{label_id}_{int(time.time())}"
+        
+        # Register this transfer in active threads
+        transfer_info = {
+            'transfer_id': transfer_id,
+            'label_id': label_id,
+            'label_name': label_name,
+            'stop_event': stop_event,
+            'start_time': time.time()
+        }
+        self.active_threads.append(transfer_info)
         
         # Enhanced statistics with thread tracking
         stats = {
@@ -819,7 +927,8 @@ class GmailToImapTransfer:
                 logging.info(f"📥 Processing {len(message_ids)} messages in batches of {batch_size}")
                 
                 for i in range(0, len(message_ids), batch_size):
-                    if stop_event.is_set():
+                    if stop_event.is_set() or self.shutdown_requested:
+                        logging.info("📥 Gmail fetcher: shutdown requested, stopping batch processing")
                         break
                         
                     batch = message_ids[i:i + batch_size]
@@ -939,6 +1048,11 @@ class GmailToImapTransfer:
                 
                 while True:
                     try:
+                        # Check for shutdown request
+                        if stop_event.is_set() or self.shutdown_requested:
+                            logging.info("📤 IMAP uploader: shutdown requested, stopping upload processing")
+                            break
+                        
                         # Get message from queue (blocks until available)
                         item = message_queue.get(timeout=30)  # 30 second timeout
                         
@@ -1074,8 +1188,10 @@ class GmailToImapTransfer:
                     logging.info(f"🔍 Thread Health: Fetcher {fetcher_status} | Uploader {uploader_status}")
                     logging.info(f"📊 Resources: Memory +{memory_delta:.1f}MB | Connections +{connection_delta}")
                 
-                # Check for user interruption
-                if stop_event.is_set():
+                # Check for user interruption or shutdown
+                if stop_event.is_set() or self.shutdown_requested:
+                    logging.info("🛑 Shutdown requested, stopping thread monitoring")
+                    stop_event.set()  # Ensure both threads know to stop
                     break
             
             # Wait for threads to complete with timeout
@@ -1111,11 +1227,9 @@ class GmailToImapTransfer:
             fetcher_pbar.close()
             uploader_pbar.close()
             
-            # Clean up thread tracking
-            try:
-                self.active_threads.remove(transfer_threads)
-            except ValueError:
-                pass  # Already removed
+            # Clean up thread tracking - remove current transfer info
+            self.active_threads = [t for t in self.active_threads
+                                 if t.get('transfer_id') != transfer_id]
         
         # Report comprehensive threading and resource statistics
         final_memory = process.memory_info().rss / (1024 * 1024)
